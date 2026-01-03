@@ -1,6 +1,5 @@
 import OpenAI from "openai";
-import type { JudgePayload, JudgeResult } from "./schema";
-import { JudgeResultSchema } from "./schema";
+import { JudgePayloadSchema, JudgeResultSchema, type JudgePayload, type JudgeResult } from "./schema";
 import { extractFirstJsonObject, safeJsonParse } from "./util";
 import { safeFallbackResult } from "./safety";
 
@@ -9,87 +8,73 @@ const client = new OpenAI({
 });
 
 function buildPrompt(payload: JudgePayload) {
-  // Keep it “low-language”, entertainment-only, safe.
-  // No sensitive attributes; roast the user's “style” not identity.
+  // Keep it extremely simple English, global friendly, no sensitive areas.
+  // We do NOT mention race/politics/religion/sex/medical.
+  const summary = payload.rounds.map((r, i) => ({
+    round: i + 1,
+    icon: r.promptIcon,
+    chosenTags: r.chosenTags,
+    others: r.othersSummary.slice(0, 6),
+    timeMs: r.responseTimeMs
+  }));
+
   const system =
-    `You are JudgeMirror, a comedy mirror game.
-Return ONLY valid JSON. No markdown.
-Strict rules:
-- Entertainment only.
-- No politics, religion, race/nationality/ethnicity, hate, sex, violence, real-world conflicts.
-- No medical or diagnosis claims.
-- Keep English VERY simple. Short sentences.
-- Funny, slightly humiliating, but harmless.
-Output JSON with keys: label, roast, cta, safetyLevel, resultTags.
-safetyLevel must be "ok".`;
+    `You are JudgeMirror, a playful roast generator for a mobile game.
+Rules:
+- Entertainment only. Do NOT mention politics, religion, race/nationality/ethnicity, sexual content, real-world conflicts, medical/diagnosis.
+- No hate. No threats. No bullying about protected traits. No self-harm content.
+- Keep English VERY easy for non-native speakers.
+- Output MUST be a single JSON object only. No extra text.
+
+JSON schema:
+{
+  "label": string (1-60),
+  "roast": string (1-240) funny + humiliating but safe,
+  "cta": string (1-80) simple share call,
+  "safetyLevel": "safe" | "extra_safe",
+  "resultTags": string[] (0-10)
+}`;
 
   const user =
-    `Game data:
-promptIcon: ${payload.promptIcon}
-chosenTags: ${payload.chosenTags.slice(0, 80).join(", ")}
-responseTimeMs: ${payload.responseTimeMs.slice(0, 20).join(", ")}
-othersSummaryCount: ${payload.othersSummary.length}
+    `Game data (7 rounds max):
+${JSON.stringify(summary)}
 
-Create:
-- label: 2-4 words
-- roast: 1-2 short sentences (max 220 chars)
-- cta: 2-5 words
-- resultTags: 3-8 simple tags
-Remember: output ONLY JSON.`;
+Task:
+Make a short funny "bias" result about the user.
+Make it feel like: "you always pick X so you are Y".
+Keep it safe and non-sensitive.
+Return ONLY JSON.`;
 
   return { system, user };
 }
 
-function getTextFromResponse(resp: any): string {
-  // OpenAI SDK response shapes can evolve. This tries multiple known shapes.
-  if (typeof resp?.output_text === "string") return resp.output_text;
+export async function judgeWithOpenAI(payloadRaw: unknown): Promise<JudgeResult> {
+  const parsed = JudgePayloadSchema.safeParse(payloadRaw);
+  if (!parsed.success) return safeFallbackResult();
 
-  // Sometimes `output` is an array of items; try to collect text fields
-  if (Array.isArray(resp?.output)) {
-    const parts: string[] = [];
-    for (const item of resp.output) {
-      // common: item.content: [{ type: "output_text", text: "..." }]
-      if (Array.isArray(item?.content)) {
-        for (const c of item.content) {
-          if (typeof c?.text === "string") parts.push(c.text);
-        }
-      }
-    }
-    if (parts.length) return parts.join("\n");
-  }
+  const payload = parsed.data;
+  const built = buildPrompt(payload);
 
-  return JSON.stringify(resp);
-}
-
-export async function judgeWithOpenAI(payload: JudgePayload): Promise<JudgeResult> {
   try {
-    const built = buildPrompt(payload);
-
-    // Responses API (text only). We instruct JSON and parse ourselves.
     const resp = await client.responses.create({
       model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
       input: [
         { role: "system", content: built.system },
         { role: "user", content: built.user }
-      ]
+      ],
+      store: false
     });
 
-    const text = getTextFromResponse(resp);
-    const jsonChunk = extractFirstJsonObject(text) ?? text;
-    const parsed = safeJsonParse<unknown>(jsonChunk);
+    const text = (resp as any).output_text ?? JSON.stringify(resp);
+    const jsonBlock = extractFirstJsonObject(text) ?? text;
+    const j = safeJsonParse<unknown>(jsonBlock);
 
-    const validated = JudgeResultSchema.safeParse(parsed);
-    if (!validated.success) {
-      return safeFallbackResult("bad_model_json");
-    }
+    if (!j.ok) return safeFallbackResult();
 
-    // Force safetyLevel ok (model might drift)
-    return {
-      ...validated.data,
-      safetyLevel: "ok"
-    };
-  } catch (e) {
-    console.error("OpenAI error:", e);
-    return safeFallbackResult("openai_error");
+    const out = JudgeResultSchema.safeParse(j.value);
+    if (!out.success) return safeFallbackResult();
+    return out.data;
+  } catch {
+    return safeFallbackResult();
   }
 }
